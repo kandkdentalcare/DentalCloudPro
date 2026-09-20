@@ -4488,6 +4488,7 @@ const App: React.FC = () => {
                     fetchInitialData(); // Refresh to update has_account status
                   } catch (err: any) {
                     setToast({ show: true, message: err?.message || 'Failed to update patient portal account.', type: 'error' });
+                    throw err;
                   }
                 }}
                 onNotify={(message, type) => setToast({ show: true, message, type })}
@@ -4783,6 +4784,7 @@ const App: React.FC = () => {
                     fetchInitialData();
                   } catch (err: any) {
                     alert('Error: ' + err.message);
+                    throw err;
                   }
                 }}
                 onCreateAppointment={handleCreateAppointmentFromClinical}

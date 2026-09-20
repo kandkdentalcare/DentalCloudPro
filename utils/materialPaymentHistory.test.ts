@@ -24,6 +24,7 @@ describe('material payment history', () => {
     expect(rows.map((row) => row.receiptNumber)).toEqual(['REC-002', 'REC-001']);
     expect(rows.map((row) => row.totalPaid)).toEqual([600, 400]);
     expect(rows.map((row) => row.appliedToTreatment)).toEqual([600, 400]);
+    expect(rows.map((row) => row.treatmentIds)).toEqual([['t1'], ['t1']]);
   });
 
   it('hides voided collections and keeps them out of treatment allocation', () => {

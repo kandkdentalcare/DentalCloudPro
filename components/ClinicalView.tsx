@@ -67,7 +67,7 @@ interface ClinicalViewProps {
   onUndoMedicineSale?: (sale: MedicineSale) => Promise<void>;
   onRedeemPoints?: (points: number, amount: number) => void;
   onUpdatePatient?: (id: string, data: Partial<Patient>) => Promise<void>;
-  onUpdateAccount?: (patient: Patient, password: string) => void;
+  onUpdateAccount?: (patient: Patient, password: string) => Promise<void>;
   onCreateAppointment?: (data: Partial<Appointment>) => Promise<void>;
   appointments: Appointment[];
   appointmentTypes: AppointmentType[];
@@ -1365,10 +1365,14 @@ const ClinicalView: React.FC<ClinicalViewProps> = ({
                        </button>
                        <button 
                          disabled={newPassword.length < 4}
-                         onClick={() => {
+                         onClick={async () => {
                            if (onUpdateAccount) {
-                             onUpdateAccount(selectedPatient, newPassword);
-                             setAuthModal(false);
+                             try {
+                               await onUpdateAccount(selectedPatient, newPassword);
+                               setAuthModal(false);
+                             } catch {
+                               // The caller reports the error; keep this modal open so it can be corrected.
+                             }
                            }
                          }}
                          className="flex-1 bg-indigo-600 text-white px-6 py-3 rounded-xl font-bold shadow-lg shadow-indigo-600/20 hover:bg-indigo-700 transition-all disabled:opacity-50 flex items-center justify-center gap-2"

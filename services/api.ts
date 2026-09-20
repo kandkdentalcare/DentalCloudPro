@@ -22,6 +22,7 @@ import { chunkUniqueIds, mapWithConcurrency, REPORT_REQUEST_CONCURRENCY } from '
 import { normalizeMaterialCostPresetInputs, sortMaterialCostPresets } from '../utils/materialCostPresets';
 import { buildDoctorDirectWritePayload } from '../utils/doctorWritePayload';
 import { excludeProtectedDoctorChange } from '../utils/appointmentDoctorUpdate';
+import { getPatientAuthConflictMessage } from '../utils/patientAuthConflict';
 
 let usersAllowedTabsSupport: boolean | null = null;
 let usersDoctorIdSupport: boolean | null = null;
@@ -2013,6 +2014,18 @@ export const api = {
 
       const patientLocationId = patientRecord?.location_id || null;
 
+      if (normalizedEmail) {
+        const { data: emailOwner, error: emailOwnerError } = await supabase
+          .from('patient_auth')
+          .select('patient_id')
+          .eq('email', normalizedEmail)
+          .maybeSingle();
+        if (emailOwnerError) throw new Error(emailOwnerError.message);
+        if (emailOwner?.patient_id && emailOwner.patient_id !== patientId) {
+          throw new Error('This email is already used by another patient portal account. Update the patient email or use the existing portal account.');
+        }
+      }
+
       // Check if auth record exists
       const { data: existing } = await supabase
         .from('patient_auth')
@@ -2030,7 +2043,7 @@ export const api = {
           .from('patient_auth')
           .update(updateData)
           .eq('patient_id', patientId);
-        if (error) throw new Error(error.message);
+        if (error) throw new Error(getPatientAuthConflictMessage(error) || error.message);
       } else {
         // Create
         const { error } = await supabase
@@ -2044,7 +2057,7 @@ export const api = {
             password: password,
             is_verified: true
           });
-        if (error) throw new Error(error.message);
+        if (error) throw new Error(getPatientAuthConflictMessage(error) || error.message);
       }
     },
 

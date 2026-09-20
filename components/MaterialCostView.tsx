@@ -1,22 +1,14 @@
 import React, { useMemo, useState } from 'react';
-import { ArrowLeftRight, Beaker, History, Loader2, Package, Plus, RotateCw, Search, Stethoscope } from 'lucide-react';
+import { ArrowLeftRight, Beaker, Loader2, Package, Plus, RotateCw, Search, Stethoscope } from 'lucide-react';
 import type { ClinicalRecord, PaymentRecord, TreatmentCostSummary } from '../types';
 import { api } from '../services/api';
 import { formatCurrency, type Currency } from '../utils/currency';
 import { toLocalISODate } from '../utils/auditLogFilters';
-import { buildAuditLogRows, filterAuditLogRowsForExport, type AuditExportRow } from '../utils/auditLogExport';
 import { formatTeethWithPosition } from '../utils/toothNumbering';
-import { formatDoctorName } from '../utils/doctorName';
-import { sortMaterialCostRowsNewestFirst } from '../utils/materialCostRows';
-import {
-  calculateCollectedByTreatmentId,
-  calculateMaterialAdjustedDoctorEarnings,
-  calculateMaterialNetProfit
-} from '../utils/materialCostCalculations';
+import { formatDoctorName, normalizeDoctorName } from '../utils/doctorName';
 import { buildMaterialPaymentHistoryRows, filterMaterialPaymentHistoryRows } from '../utils/materialPaymentHistory';
 import Pagination from './Pagination';
 import MaterialCostModal from './MaterialCostModal';
-import MaterialPaymentHistory from './MaterialPaymentHistory';
 
 interface MaterialCostViewProps {
   records: ClinicalRecord[];
@@ -30,9 +22,13 @@ interface MaterialCostViewProps {
   onCostsSaved?: (patientId?: string | null) => Promise<void> | void;
 }
 
-type TreatmentAuditRow = Extract<AuditExportRow, { kind: 'treatment' }>;
 type MaterialCostFilter = 'all' | 'tomorrow' | 'today' | 'custom';
-type MaterialCostTab = 'operation' | 'payments';
+type MaterialCostRow = {
+  paymentId: string;
+  collectedAmount: number;
+  doctorEarned: number;
+  record: ClinicalRecord & { _groupedRecords?: ClinicalRecord[] };
+};
 
 const getTreatmentRecordIds = (record: ClinicalRecord & { _groupedRecords?: ClinicalRecord[] }) => {
   const groupedRecords = record._groupedRecords?.length ? record._groupedRecords : [record];
@@ -44,7 +40,6 @@ const MaterialCostView: React.FC<MaterialCostViewProps> = ({ records, paymentRec
   const tableScrollRef = React.useRef<HTMLDivElement>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [showAll, setShowAll] = useState(false);
-  const [activeTab, setActiveTab] = useState<MaterialCostTab>('operation');
   const [patientSearchTerm, setPatientSearchTerm] = useState('');
   const [doctorSearchTerm, setDoctorSearchTerm] = useState('');
   const [treatmentSearchTerm, setTreatmentSearchTerm] = useState('');
@@ -64,47 +59,6 @@ const MaterialCostView: React.FC<MaterialCostViewProps> = ({ records, paymentRec
   const isTodayRange = dateFrom === todayKey && dateTo === todayKey;
   const itemsPerPage = 10;
 
-  const treatmentRows = useMemo<TreatmentAuditRow[]>(() => (
-    buildAuditLogRows(records, [], false, [], [])
-      .filter((row): row is TreatmentAuditRow => row.kind === 'treatment')
-  ), [records]);
-
-  const collectedByTreatmentId = useMemo(
-    () => calculateCollectedByTreatmentId(records, paymentRecords),
-    [records, paymentRecords]
-  );
-
-  const baseFilteredRows = useMemo(() => {
-    return filterAuditLogRowsForExport(treatmentRows, {
-      auditFilter: 'treatments',
-      dateFrom,
-      dateTo,
-      searchTerm: ''
-    }) as TreatmentAuditRow[];
-  }, [treatmentRows, dateFrom, dateTo]);
-
-  const statusFilteredRows = useMemo(() => {
-    const patientTerm = patientSearchTerm.trim().toLowerCase();
-    const doctorTerm = doctorSearchTerm.trim().toLowerCase();
-    const treatmentTerm = treatmentSearchTerm.trim().toLowerCase();
-
-    const matchingRows = baseFilteredRows.filter((row) => {
-      const record = row.record;
-      const groupedRecords = record._groupedRecords?.length ? record._groupedRecords : [record];
-
-      const matchesPatient = !patientTerm || [record.patient_name, record.patient_unique_id, record.patient_id]
-        .some((value) => (value || '').toLowerCase().includes(patientTerm));
-      const matchesDoctor = !doctorTerm || (record.doctor_name || '').toLowerCase().includes(doctorTerm);
-      const matchesTreatment = !treatmentTerm || groupedRecords.some((item) =>
-        (item.description || '').toLowerCase().includes(treatmentTerm)
-      );
-
-      return matchesPatient && matchesDoctor && matchesTreatment;
-    });
-
-    return sortMaterialCostRowsNewestFirst(matchingRows);
-  }, [baseFilteredRows, patientSearchTerm, doctorSearchTerm, treatmentSearchTerm]);
-
   const paymentHistoryRows = useMemo(
     () => filterMaterialPaymentHistoryRows(
       buildMaterialPaymentHistoryRows(records, paymentRecords),
@@ -113,7 +67,41 @@ const MaterialCostView: React.FC<MaterialCostViewProps> = ({ records, paymentRec
     [records, paymentRecords, dateFrom, dateTo, patientSearchTerm, doctorSearchTerm, treatmentSearchTerm]
   );
 
-  const loadMaterialSummaries = React.useCallback(async (rowsToLoad: TreatmentAuditRow[]) => {
+  const statusFilteredRows = useMemo<MaterialCostRow[]>(() => {
+    const recordById = new Map(records.map((record) => [record.id, record]));
+    return paymentHistoryRows.flatMap((paymentRow) => {
+      const linkedRecords = paymentRow.treatmentIds
+        .map((id) => recordById.get(id))
+        .filter((record): record is ClinicalRecord => !!record);
+      if (linkedRecords.length === 0) return [];
+
+      const doctorNames = Array.from(new Map(
+        linkedRecords
+          .map((record) => normalizeDoctorName(record.doctor_name))
+          .filter(Boolean)
+          .map((name) => [name.toLocaleLowerCase(), name])
+      ).values());
+      const record = {
+        ...linkedRecords[0],
+        date: paymentRow.date,
+        patient_name: paymentRow.patientName,
+        patient_unique_id: paymentRow.patientUniqueId,
+        patient_balance: paymentRow.balanceAfter,
+        doctor_name: doctorNames.length > 0 ? doctorNames.join(', Dr. ') : undefined,
+        teeth: [...new Set(linkedRecords.flatMap((item) => item.teeth || []))].sort((a, b) => a - b),
+        _groupedRecords: linkedRecords
+      };
+
+      return [{
+        paymentId: paymentRow.id,
+        collectedAmount: paymentRow.totalPaid,
+        doctorEarned: paymentRow.doctorEarned,
+        record
+      }];
+    });
+  }, [paymentHistoryRows, records]);
+
+  const loadMaterialSummaries = React.useCallback(async (rowsToLoad: MaterialCostRow[]) => {
     const requestVersion = ++summaryRequestVersion.current;
     const treatmentIds = rowsToLoad.flatMap((row) => getTreatmentRecordIds(row.record));
     if (treatmentIds.length === 0) {
@@ -175,27 +163,12 @@ const MaterialCostView: React.FC<MaterialCostViewProps> = ({ records, paymentRec
     return groupedRecords.reduce((sum, item) => sum + Number(item.cost || 0), 0);
   };
 
-  const getCollectedAmount = (record: ClinicalRecord & { _groupedRecords?: ClinicalRecord[] }) => {
-    return getTreatmentRecordIds(record).reduce((sum, treatmentId) => {
-      return sum + Number(collectedByTreatmentId[treatmentId] || 0);
-    }, 0);
+  const getNetReceive = (record: ClinicalRecord & { _groupedRecords?: ClinicalRecord[] }, collectedAmount: number) => {
+    return Math.max(0, collectedAmount - getMaterialTotal(record));
   };
 
-  const getNetReceive = (record: ClinicalRecord & { _groupedRecords?: ClinicalRecord[] }) => {
-    return Math.max(0, getCollectedAmount(record) - getMaterialTotal(record));
-  };
-
-  const getAdjustedDoctorEarned = (record: ClinicalRecord & { _groupedRecords?: ClinicalRecord[] }) => {
-    const groupedRecords = record._groupedRecords?.length ? record._groupedRecords : [record];
-    return calculateMaterialAdjustedDoctorEarnings(groupedRecords);
-  };
-
-  const getNetProfit = (record: ClinicalRecord & { _groupedRecords?: ClinicalRecord[] }) => {
-    const groupedRecords = record._groupedRecords?.length ? record._groupedRecords : [record];
-    return calculateMaterialNetProfit(
-      groupedRecords,
-      (treatmentId) => Number(materialSummaries[treatmentId]?.totalAmount || 0)
-    );
+  const getNetProfit = (record: ClinicalRecord & { _groupedRecords?: ClinicalRecord[] }, collectedAmount: number, doctorEarned: number) => {
+    return collectedAmount - getMaterialTotal(record) - doctorEarned;
   };
 
   const paginatedRows = useMemo(() => {
@@ -354,10 +327,10 @@ const MaterialCostView: React.FC<MaterialCostViewProps> = ({ records, paymentRec
               <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
                 <div className="flex max-w-full gap-2 overflow-x-auto pb-1 sm:flex-wrap sm:overflow-visible sm:pb-0">
                   <span className="shrink-0 rounded-full border border-slate-200 bg-white px-3 py-1 font-semibold text-slate-700">
-                    {activeTab === 'operation' ? statusFilteredRows.length : paymentHistoryRows.length} visible
+                    {statusFilteredRows.length} visible
                   </span>
                   <span className="shrink-0 rounded-full border theme-accent-border theme-accent-soft-bg px-3 py-1 font-semibold theme-accent-text">
-                    {activeTab === 'operation' ? `${statusFilteredRows.length} treatments` : `${paymentHistoryRows.length} payments`}
+                    {statusFilteredRows.length} payments
                   </span>
                 </div>
                 <button
@@ -472,34 +445,11 @@ const MaterialCostView: React.FC<MaterialCostViewProps> = ({ records, paymentRec
         </div>
       </div>
 
-      <div className="flex items-end gap-1 overflow-x-auto border-b border-slate-200 bg-white px-3 pt-2 sm:px-5">
-        <button
-          type="button"
-          onClick={() => setActiveTab('operation')}
-          className={`flex min-h-14 flex-none items-center justify-start gap-2 border-b-2 px-3 text-left transition-colors sm:gap-3 sm:px-4 ${activeTab === 'operation' ? 'border-[var(--hover-500)] text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-800'}`}
-        >
-          <Package size={18} className={activeTab === 'operation' ? 'text-[var(--hover-600)]' : ''} />
-          <span><span className="block text-sm font-black">Operation</span><span className="hidden text-[10px] text-slate-500 sm:block">Costs and overall earnings</span></span>
-          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold">{statusFilteredRows.length}</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('payments')}
-          className={`flex min-h-14 flex-none items-center justify-start gap-2 border-b-2 px-3 text-left transition-colors sm:gap-3 sm:px-4 ${activeTab === 'payments' ? 'border-emerald-500 text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-800'}`}
-        >
-          <History size={18} className={activeTab === 'payments' ? 'text-emerald-600' : ''} />
-          <span><span className="block text-sm font-black">Payment History</span><span className="hidden text-[10px] text-slate-500 sm:block">Each collection and commission</span></span>
-          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700">{paymentHistoryRows.length}</span>
-        </button>
-      </div>
-
       {loading ? (
         <div className="flex flex-col items-center justify-center gap-3 p-12 text-slate-500">
           <Loader2 className="animate-spin text-[var(--hover-600)]" />
           <p className="text-sm font-medium">Loading treatment cost and payment rows...</p>
         </div>
-      ) : activeTab === 'payments' ? (
-        <MaterialPaymentHistory rows={paymentHistoryRows} currency={currency} />
       ) : (
         <>
         <div className="hidden xl:block">
@@ -557,12 +507,12 @@ const MaterialCostView: React.FC<MaterialCostViewProps> = ({ records, paymentRec
                 paginatedRows.map((row) => {
                   const record = row.record;
                   const treatmentAmount = getTreatmentAmount(record);
-                  const collectedAmount = getCollectedAmount(record);
-                  const netReceive = getNetReceive(record);
-                  const adjustedDoctorEarned = getAdjustedDoctorEarned(record);
-                  const netProfit = getNetProfit(record);
+                  const collectedAmount = row.collectedAmount;
+                  const netReceive = getNetReceive(record, collectedAmount);
+                  const adjustedDoctorEarned = row.doctorEarned;
+                  const netProfit = getNetProfit(record, collectedAmount, adjustedDoctorEarned);
                   return (
-                    <tr key={`material-cost-${record.id}`} className="group border-l-4 border-[var(--hover-300)] transition-colors hover:bg-[var(--hover-50)]/30">
+                    <tr key={`material-cost-${row.paymentId}`} className="group border-l-4 border-[var(--hover-300)] transition-colors hover:bg-[var(--hover-50)]/30">
                       <td className="whitespace-nowrap px-4 py-4 text-sm text-slate-500 xl:px-6">{record.date}</td>
                       <td className="px-4 py-4 font-bold text-slate-900 xl:px-6">{record.patient_name || 'Unknown'}</td>
                       <td className="px-4 py-4 text-sm text-slate-700 xl:px-6">{formatDoctorName(record.doctor_name)}</td>
@@ -615,13 +565,13 @@ const MaterialCostView: React.FC<MaterialCostViewProps> = ({ records, paymentRec
             paginatedRows.map((row) => {
               const record = row.record;
               const treatmentAmount = getTreatmentAmount(record);
-              const collectedAmount = getCollectedAmount(record);
-              const adjustedDoctorEarned = getAdjustedDoctorEarned(record);
-              const netProfit = getNetProfit(record);
+              const collectedAmount = row.collectedAmount;
+              const adjustedDoctorEarned = row.doctorEarned;
+              const netProfit = getNetProfit(record, collectedAmount, adjustedDoctorEarned);
               const totalCost = getMaterialTotal(record);
-              const netReceive = getNetReceive(record);
+              const netReceive = getNetReceive(record, collectedAmount);
               return (
-                <article key={`material-cost-card-${record.id}`} className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                <article key={`material-cost-card-${row.paymentId}`} className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
                   <div className="border-l-4 border-[var(--hover-300)] p-3 sm:p-4">
                     <div className="flex min-w-0 items-start justify-between gap-3">
                       <div className="min-w-0 flex-1">
@@ -705,7 +655,7 @@ const MaterialCostView: React.FC<MaterialCostViewProps> = ({ records, paymentRec
         </>
       )}
 
-      {!loading && activeTab === 'operation' && statusFilteredRows.length > 0 && (
+      {!loading && statusFilteredRows.length > 0 && (
         <Pagination
           totalItems={statusFilteredRows.length}
           itemsPerPage={itemsPerPage}

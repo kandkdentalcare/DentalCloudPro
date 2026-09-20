@@ -17,6 +17,7 @@ export interface MaterialPaymentHistoryRow {
   patientUniqueId: string;
   doctorNames: string[];
   treatmentNames: string[];
+  treatmentIds: string[];
   totalPaid: number;
   appliedToTreatment: number;
   balanceAfter: number;
@@ -104,6 +105,7 @@ export const buildMaterialPaymentHistoryRows = (
       patientUniqueId: payment.receiptSnapshot?.patient.patientUniqueId || patientRecords[0]?.patient_unique_id || payment.patientId,
       doctorNames,
       treatmentNames,
+      treatmentIds: linkedTreatmentIds,
       totalPaid: money(payment.clearedAmount ?? payment.amount),
       appliedToTreatment: roundMoney(appliedToTreatment),
       balanceAfter: money(payment.receiptSnapshot?.payment.balanceAfter ?? payment.remainingBalance),

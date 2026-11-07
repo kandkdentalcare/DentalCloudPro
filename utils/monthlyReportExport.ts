@@ -1,10 +1,22 @@
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { formatCurrency } from './currency';
-import { groupMonthlyReportDetailRows, monthlyReportFilename, type MonthlyReport, type MonthlyReportGroup, type MonthlyReportMetadata } from './monthlyReport';
+import { formatAuditCreatedAt } from './auditLogExport';
+import { groupMonthlyReportDetailRows, monthlyReportFilename, type MonthlyReport, type MonthlyReportGroup, type MonthlyReportMetadata, type MonthlyReportPayment } from './monthlyReport';
 
 const percentage = (value: number): string => `${(value * 100).toFixed(1)}%`;
 const generatedLabel = (date: Date): string => date.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+const paymentMethodLabel = (method?: string): string => (method ? method.replace(/_/g, ' ') : 'Not recorded');
+// The Payments table shows the same date/time the Audit Log → Payments tab shows
+// for the receipt, so a report row can be found on that page without guessing.
+const paymentLogDateTime = (payment: MonthlyReportPayment): string =>
+  formatAuditCreatedAt(payment.voidedAt || payment.createdAt || payment.date);
+const paymentLogSortValue = (payment: MonthlyReportPayment): string =>
+  payment.voidedAt || payment.createdAt || payment.date || '';
+const sortReportPayments = (payments: MonthlyReportPayment[]): MonthlyReportPayment[] => [...payments].sort((a, b) =>
+  paymentLogSortValue(a).localeCompare(paymentLogSortValue(b))
+  || (a.receiptNumber || '').localeCompare(b.receiptNumber || '')
+  || a.id.localeCompare(b.id));
 
 const addPdfFooter = (doc: jsPDF, metadata: MonthlyReportMetadata) => {
   const drawingDoc = doc as any;
@@ -143,6 +155,63 @@ export const exportMonthlyReportToPDF = (report: MonthlyReport, metadata: Monthl
   const secondEnd = Number((doc as any).lastAutoTable?.finalY || 145);
   if (secondEnd > doc.internal.pageSize.height - 65) doc.addPage();
   addPdfGroupTable(doc, 'Patient Type Performance', report.byPatientType, secondEnd > doc.internal.pageSize.height - 65 ? 20 : secondEnd + 10, metadata);
+
+  if ((report.payments || []).length > 0) {
+    const paymentRecords = sortReportPayments(report.payments || []);
+    const paymentRows = paymentRecords.map(payment => [
+      paymentLogDateTime(payment),
+      payment.receiptNumber || 'Not recorded',
+      payment.patient_name?.trim() || 'Unknown patient',
+      payment.patient_type?.trim() || 'Not assigned',
+      payment.type,
+      paymentMethodLabel(payment.paymentMethod),
+      formatCurrency(payment.amount, metadata.currency),
+      payment.balanceBefore === null || payment.balanceBefore === undefined ? '-' : formatCurrency(payment.balanceBefore, metadata.currency),
+      formatCurrency(payment.remainingBalance, metadata.currency),
+      String((payment.treatmentIds || []).length),
+      formatCurrency(payment.doctorEarned ?? 0, metadata.currency),
+      payment.voidedAt ? 'Voided' : 'Active',
+      payment.createdByUserName?.trim() || 'Not recorded'
+    ]);
+    const activePaymentTotal = paymentRecords
+      .filter(payment => !payment.voidedAt)
+      .reduce((total, payment) => total + (Number.isFinite(payment.amount) ? payment.amount : 0), 0);
+    doc.addPage();
+    doc.setFontSize(18);
+    doc.setTextColor(15, 23, 42);
+    doc.text('Payments Received', 14, 20);
+    doc.setFontSize(8);
+    doc.setTextColor(100, 116, 139);
+    drawingDoc.text('Same receipts, recorded date/time and doctor commission as the Audit Log → Payments tab. Voided payments are listed but excluded from the total.', 14, 27, { maxWidth: width - 28 });
+    doc.setFontSize(9);
+    doc.setTextColor(15, 23, 42);
+    doc.text(`Collected Treatment Payment (this period): ${formatCurrency(report.summary.payment, metadata.currency)}`, 14, 35);
+    doc.text(`Balance Collections (previous debt): ${formatCurrency(report.summary.balanceCollections, metadata.currency)}`, 14, 41);
+    doc.text(`Total Collected Receipts: ${formatCurrency(report.summary.collectedReceipts, metadata.currency)}`, 14, 47);
+    autoTable(doc, {
+      startY: 53,
+      head: [['Date / Time', 'Receipt No.', 'Patient', 'Patient Type', 'Payment Type', 'Method', 'Amount', 'Balance Before', 'Remaining Balance', 'Treatments', 'Doctor Earned', 'Status', 'Recorded By']],
+      body: paymentRows,
+      foot: [['TOTAL (active payments)', '', '', '', '', '', formatCurrency(activePaymentTotal, metadata.currency), '', '', '', '', '', '']],
+      theme: 'striped',
+      headStyles: { fillColor: [30, 41, 59], textColor: 255, fontSize: 7, fontStyle: 'bold' },
+      bodyStyles: { fontSize: 7, textColor: [51, 65, 85] },
+      footStyles: { fillColor: [226, 232, 240], textColor: [15, 23, 42], fontSize: 7, fontStyle: 'bold' },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+      columnStyles: {
+        0: { cellWidth: 26 }, 1: { cellWidth: 24 }, 2: { cellWidth: 36 }, 3: { cellWidth: 24 },
+        4: { cellWidth: 22 }, 5: { cellWidth: 24 }, 6: { halign: 'right' }, 7: { halign: 'right' },
+        8: { halign: 'right' }, 9: { halign: 'center' }, 10: { halign: 'right' }
+      },
+      didParseCell: hook => {
+        if (hook.section === 'body' && hook.column.index === 11 && paymentRows[hook.row.index]?.[11] === 'Voided') {
+          hook.cell.styles.textColor = [190, 24, 93];
+          hook.cell.styles.fontStyle = 'bold';
+        }
+      },
+      margin: { left: 14, right: 14, bottom: 18 }
+    });
+  }
 
   if (report.costItems !== undefined) {
     doc.addPage();
@@ -346,11 +415,11 @@ export const buildMonthlyReportExcelWorkbook = async (report: MonthlyReport, met
     [reportSubtitle(metadata), '', '', '', '', '', '', ''],
     [`Generated ${generatedLabel(generatedAt)}`, '', '', '', '', '', '', ''],
     ['', '', '', '', '', '', '', ''],
-    ['REPORT VOLUME', '', '', 'REVENUE & COLLECTIONS', '', '', 'COSTS & PROFITABILITY', ''],
+    ['REPORT VOLUME & COLLECTIONS', '', '', 'REVENUE & COLLECTIONS', '', '', 'COSTS & PROFITABILITY', ''],
     ['Treatments Performed', report.summary.treatmentCount, '', 'Treatment Production', report.summary.production, '', 'Material Cost', report.summary.materialCost],
     ['Distinct Patients', report.summary.patientCount, '', 'Standard Production', report.summary.standardProduction, '', 'Lab Cost', report.summary.labCost],
-    ['', '', '', 'Treatment Discount', report.summary.discount, '', 'Special Doctor Cost', report.summary.specialDoctorCost],
-    ['', '', '', 'Service Charges', report.summary.serviceCharges, '', 'MLS Total', report.summary.mlsTotal],
+    ['Balance Collections (Prev. Debt)', report.summary.balanceCollections, '', 'Treatment Discount', report.summary.discount, '', 'Special Doctor Cost', report.summary.specialDoctorCost],
+    ['Total Collected Receipts', report.summary.collectedReceipts, '', 'Service Charges', report.summary.serviceCharges, '', 'MLS Total', report.summary.mlsTotal],
     ['', '', '', 'Medicine Sales', report.summary.medicineSales, '', 'Doctor Cost', report.summary.doctorCost],
     ['', '', '', 'Total Revenue', report.summary.totalRevenue, '', 'Operating Expenses', report.summary.operatingExpenses],
     ['', '', '', 'Collected Treatment Payment', report.summary.payment, '', 'Total Cost', report.summary.totalCost],
@@ -358,10 +427,10 @@ export const buildMonthlyReportExcelWorkbook = async (report: MonthlyReport, met
     ['', '', '', 'Collection Rate', report.summary.collectionRate, '', 'Net Margin', report.summary.netMargin],
     ['', '', '', '', '', '', '', ''],
     ['REPORT DEFINITION', '', '', '', '', '', '', ''],
-    ['Net Profit = Treatment Production + Service Charges + Medicine Sales - MLS Total - Doctor Cost - Operating Expenses. Outstanding Patient Balance is the current database balance for each distinct report patient and is counted once per patient. MLS-generated expenses are excluded from Operating Expenses to prevent double counting.', '', '', '', '', '', '', '']
+    ['Net Profit = Treatment Production + Service Charges + Medicine Sales - MLS Total - Doctor Cost - Operating Expenses. Outstanding Patient Balance is the current database balance for each distinct report patient and is counted once per patient. MLS-generated expenses are excluded from Operating Expenses to prevent double counting. Balance Collections (Prev. Debt) are receipts from this period applied to treatments dated before the report period, so they are listed here and in the Payments sheet but are not part of this period\'s treatment production. Total Collected Receipts equals all active receipts in the report period (the Payments sheet total).', '', '', '', '', '', '', '']
   ];
   const summarySheet: any = XLSX.utils.aoa_to_sheet(summaryRows);
-  summarySheet['!cols'] = [24, 16, 4, 24, 18, 4, 24, 18].map(wch => ({ wch }));
+  summarySheet['!cols'] = [30, 16, 4, 24, 18, 4, 24, 18].map(wch => ({ wch }));
   summarySheet['!rows'] = [{ hpt: 30 }, { hpt: 20 }, { hpt: 18 }, { hpt: 8 }, { hpt: 24 }];
   summarySheet['!merges'] = [
     XLSX.utils.decode_range('A1:H1'), XLSX.utils.decode_range('A2:H2'), XLSX.utils.decode_range('A3:H3'),
@@ -370,6 +439,9 @@ export const buildMonthlyReportExcelWorkbook = async (report: MonthlyReport, met
   ];
   summarySheet['!freeze'] = { xSplit: 0, ySplit: 4, topLeftCell: 'A5', activePane: 'bottomLeft', state: 'frozen' };
   ['E6', 'E7', 'E8', 'E9', 'E10', 'E11', 'E12', 'E13', 'H6', 'H7', 'H8', 'H9', 'H10', 'H11', 'H12', 'H13'].forEach(address => {
+    if (summarySheet[address]?.t === 'n') summarySheet[address].z = currency;
+  });
+  ['B8', 'B9'].forEach(address => {
     if (summarySheet[address]?.t === 'n') summarySheet[address].z = currency;
   });
   ['E14', 'H14'].forEach(address => {
@@ -393,7 +465,7 @@ export const buildMonthlyReportExcelWorkbook = async (report: MonthlyReport, met
     alignment: { vertical: 'center', horizontal: 'left' },
     border: excelBorder()
   }));
-  ['B6', 'B7', 'E6', 'E7', 'E8', 'E9', 'E10', 'E11', 'E12', 'E13', 'E14', 'H6', 'H7', 'H8', 'H9', 'H10', 'H11', 'H12', 'H13', 'H14'].forEach(address => {
+  ['B6', 'B7', 'B8', 'B9', 'E6', 'E7', 'E8', 'E9', 'E10', 'E11', 'E12', 'E13', 'E14', 'H6', 'H7', 'H8', 'H9', 'H10', 'H11', 'H12', 'H13', 'H14'].forEach(address => {
     applyCellStyle(summarySheet, address, { alignment: { vertical: 'center', horizontal: 'right' } });
   });
   styleProfitCell(summarySheet, 'H13', report.summary.netProfit, true);
@@ -571,6 +643,43 @@ export const buildMonthlyReportExcelWorkbook = async (report: MonthlyReport, met
   styleReportBanner(XLSX, expenseSheet, 'D');
   styleTable(XLSX, expenseSheet, 4, expenseRows.length, 5 + expenseRows.length, 'D', [3]);
   XLSX.utils.book_append_sheet(workbook, expenseSheet, 'Operating Expenses');
+
+  if (report.payments !== undefined) {
+    const paymentRecords = sortReportPayments(report.payments);
+    const paymentRows = paymentRecords.map(payment => [
+      paymentLogDateTime(payment),
+      payment.receiptNumber || 'Not recorded',
+      payment.patient_name?.trim() || 'Unknown patient',
+      payment.patient_type?.trim() || 'Not assigned',
+      payment.type,
+      paymentMethodLabel(payment.paymentMethod),
+      payment.amount,
+      payment.balanceBefore ?? '',
+      payment.remainingBalance,
+      (payment.treatmentIds || []).length,
+      payment.doctorEarned ?? 0,
+      payment.voidedAt ? 'Voided' : 'Active',
+      payment.createdByUserName?.trim() || 'Not recorded'
+    ]);
+    const activePaymentTotal = paymentRecords
+      .filter(payment => !payment.voidedAt)
+      .reduce((total, payment) => total + (Number.isFinite(payment.amount) ? payment.amount : 0), 0);
+    const paymentSheet: any = XLSX.utils.aoa_to_sheet([
+      ['PAYMENTS RECEIVED', '', '', '', '', '', '', '', '', '', '', '', ''],
+      [`${reportSubtitle(metadata)} | Same receipts, recorded date/time and doctor commission as the Audit Log → Payments tab | Voided payments are listed but excluded from the total`, '', '', '', '', '', '', '', '', '', '', '', ''],
+      ['', '', '', '', '', '', '', '', '', '', '', '', ''],
+      ['Date / Time', 'Receipt No.', 'Patient', 'Patient Type', 'Payment Type', 'Method', 'Amount', 'Balance Before', 'Remaining Balance', 'Treatments', 'Doctor Earned', 'Status', 'Recorded By'],
+      ...paymentRows,
+      ['TOTAL (active payments)', '', '', '', '', '', activePaymentTotal, '', '', '', '', '', '']
+    ]);
+    paymentSheet['!merges'] = [XLSX.utils.decode_range('A1:M1'), XLSX.utils.decode_range('A2:M2')];
+    configureTableSheet(paymentSheet, 4, paymentRows.length, 'M', [22, 20, 25, 16, 14, 17, 16, 16, 18, 12, 15, 12, 22]);
+    setNumberFormat(XLSX, paymentSheet, 5, 5 + paymentRows.length, [6, 7, 8, 10], currency);
+    styleReportBanner(XLSX, paymentSheet, 'M');
+    styleTable(XLSX, paymentSheet, 4, paymentRows.length, 5 + paymentRows.length, 'M', [6, 7, 8, 9, 10], [4, 5, 11]);
+    XLSX.utils.book_append_sheet(workbook, paymentSheet, 'Payments');
+  }
+
   return workbook;
 };
 

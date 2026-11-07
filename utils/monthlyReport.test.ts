@@ -78,6 +78,146 @@ describe('monthly report', () => {
     expect(report.summary).toMatchObject({ treatmentCount: 1, patientCount: 1, production: 100, payment: 60, balance: 40, specialDoctorCost: 15, totalCost: 50, netProfit: 50, collectionRate: 0.6 });
   });
 
+  it('separates previous-debt collections from in-period treatment payments', () => {
+    const older = record({ id: 'treatment-0', date: '2026-06-10', description: 'Previous filling' });
+    const report = buildMonthlyReport({
+      records: [record()],
+      allocationRecords: [record(), older],
+      payments: [
+        payment({ id: 'payment-balance', date: '2026-07-15', amount: 60, clearedAmount: 60, treatmentIds: ['treatment-0'], remainingBalance: 0 })
+      ],
+      costSummaries: {},
+      dateFrom: '2026-07-01',
+      dateTo: '2026-07-31'
+    });
+    // The receipt closes an older treatment that is not part of this period, so
+    // it is surfaced as a previous-debt collection, not in-period payment.
+    expect(report.summary.payment).toBe(0);
+    expect(report.summary.balanceCollections).toBe(60);
+    expect(report.summary.collectedReceipts).toBe(60);
+    expect(report.payments).toHaveLength(1);
+  });
+
+  it('keeps receipts dated outside the report period out of the collections and payment list', () => {
+    const older = record({ id: 'treatment-0', date: '2026-06-10', description: 'Previous filling' });
+    const report = buildMonthlyReport({
+      records: [record()],
+      allocationRecords: [record(), older],
+      payments: [
+        // A June receipt already reduced the older balance. It still takes part
+        // in the FIFO order, but it is not a collection of this period.
+        payment({ id: 'payment-june', date: '2026-06-20', amount: 40, clearedAmount: 40, treatmentIds: [] }),
+        payment({ id: 'payment-july', date: '2026-07-15', amount: 60, clearedAmount: 60, treatmentIds: [] })
+      ],
+      costSummaries: {},
+      dateFrom: '2026-07-01',
+      dateTo: '2026-07-31'
+    });
+    expect(report.payments.map(reportedPayment => reportedPayment.id)).toEqual(['payment-july']);
+    expect(report.summary.collectedReceipts).toBe(60);
+    expect(report.summary.payment).toBe(0);
+    expect(report.summary.balanceCollections).toBe(60);
+  });
+
+  it('reports the doctor earnings each listed receipt produced, like the payment log', () => {
+    const report = buildMonthlyReport({
+      records: [record({ doctor_id: 'doctor-1', doctor_commission_type: 'percentage', doctor_commission_percentage: 10 })],
+      payments: [payment({ amount: 60, clearedAmount: 60, treatmentIds: ['treatment-1'] })],
+      costSummaries: {},
+      dateFrom: '2026-07-01',
+      dateTo: '2026-07-31'
+    });
+    expect(report.payments[0].doctorEarned).toBe(6);
+  });
+
+  it('prefers the stored commission ledger amount for a listed receipt', () => {
+    const report = buildMonthlyReport({
+      records: [record({
+        doctor_id: 'doctor-1',
+        doctor_commission_type: 'percentage',
+        doctor_commission_percentage: 10,
+        doctorEarningEntries: [{
+          paymentId: 'payment-1', treatmentId: 'treatment-1', doctorId: 'doctor-1',
+          paymentDate: '2026-07-10', treatmentDate: '2026-07-10', calculationMode: 'percentage',
+          allocatedPayment: 60, commissionRate: 10, earnings: 6
+        }]
+      })],
+      payments: [payment({ amount: 60, clearedAmount: 60, treatmentIds: ['treatment-1'] })],
+      costSummaries: {},
+      dateFrom: '2026-07-01',
+      dateTo: '2026-07-31'
+    });
+    expect(report.payments[0].doctorEarned).toBe(6);
+  });
+
+  it('lists the stored commission loaded for a receipt even when the report history cannot infer it', () => {
+    const ledgerPayment = payment({ id: 'payment-ledger', amount: 60, clearedAmount: 60, treatmentIds: ['treatment-1'], doctorEarned: 4500 });
+    const voidedPayment = payment({ id: 'payment-voided', amount: 0, clearedAmount: 0, treatmentIds: [], doctorEarned: 900, voidedAt: '2026-07-12T00:00:00Z' });
+    const data = {
+      // The report only sees this patient's treatments, so the Audit Log row
+      // builder alone cannot infer commission for the receipts below.
+      records: [record({ cost: 100 })],
+      payments: [ledgerPayment, voidedPayment],
+      costSummaries: {},
+      dateFrom: '2026-07-01',
+      dateTo: '2026-07-31'
+    };
+    const report = buildMonthlyReport(data);
+    expect(report.payments?.find(listed => listed.id === 'payment-ledger')?.doctorEarned).toBe(4500);
+    expect(report.payments?.find(listed => listed.id === 'payment-voided')?.doctorEarned).toBe(0);
+
+    // Without the stored ledger total the same receipt reports no commission,
+    // which is why the sheet showed 0 before the ledger total was loaded.
+    const withoutStoredEarnings = buildMonthlyReport({
+      ...data,
+      payments: [payment({ id: 'payment-ledger', amount: 60, clearedAmount: 60, treatmentIds: ['treatment-1'] })]
+    });
+    expect(withoutStoredEarnings.payments?.[0].doctorEarned).toBe(0);
+  });
+
+  it('selects the listed receipts with the same date rule as the Audit Log payments tab', () => {
+    const report = buildMonthlyReport({
+      records: [],
+      payments: [
+        // Voided inside the period: the Audit Log shows it on the void date.
+        payment({
+          id: 'payment-voided-in-period', date: '2026-06-28', amount: 0, clearedAmount: 0,
+          voidedAt: '2026-07-05T09:00:00Z', originalAmount: 500
+        }),
+        // Recorded inside the period but the receipt is dated in June, so the
+        // Audit Log lists it in June and the July report must not show it.
+        payment({ id: 'payment-recorded-in-period', date: '2026-06-20', createdAt: '2026-07-01T09:00:00Z' })
+      ],
+      costSummaries: {},
+      dateFrom: '2026-07-01',
+      dateTo: '2026-07-31'
+    });
+    expect(report.payments?.map(listedPayment => listedPayment.id)).toEqual(['payment-voided-in-period']);
+    expect(report.payments?.[0].doctorEarned).toBe(0);
+    expect(report.summary.collectedReceipts).toBe(0);
+  });
+
+  it('keeps balance collections at zero when every receipt pays an in-period treatment', () => {
+    const report = buildMonthlyReport({ records: [record()], payments: [payment()], costSummaries: {} });
+    expect(report.summary.payment).toBe(60);
+    expect(report.summary.balanceCollections).toBe(0);
+    expect(report.summary.collectedReceipts).toBe(60);
+  });
+
+  it('excludes voided receipts from collected totals while still listing them', () => {
+    const report = buildMonthlyReport({
+      records: [record()],
+      payments: [
+        payment({ id: 'payment-active', amount: 40, clearedAmount: 40, treatmentIds: ['treatment-1'] }),
+        payment({ id: 'payment-void', amount: 500, clearedAmount: 500, treatmentIds: [], voidedAt: '2026-07-12T00:00:00Z' })
+      ],
+      costSummaries: {}
+    });
+    expect(report.summary.collectedReceipts).toBe(40);
+    expect(report.payments).toHaveLength(2);
+    expect(report.payments.find(payment => payment.id === 'payment-void')?.doctorEarned).toBe(0);
+  });
+
   it('includes discounts, service charges, medicine sales, MLS totals, and operating expenses', () => {
     const report = buildMonthlyReport({
       records: [record({ standardCost: 120, discountAmount: 20 })],

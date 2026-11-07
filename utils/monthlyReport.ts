@@ -8,6 +8,8 @@ import {
 } from './paymentTreatmentAllocation';
 import { chunkUniqueIds, REPORT_URL_BATCH_SIZE } from './reportBatching';
 import { getPaymentServiceFeeAmount } from './serviceFee';
+import { getAuditLogEventDate } from './auditLogFilters';
+import { buildAuditLogRows, type AuditExportRow } from './auditLogExport';
 
 export interface MonthlyReportSourceRecord extends ClinicalRecord {
   patient_age?: number | null;
@@ -46,6 +48,14 @@ export interface MonthlyReportData {
   medicineSales?: MedicineSale[];
   expenses?: Expense[];
 }
+
+// A receipt listed in the report Payments table. It is an Audit Log payment row,
+// so it carries the recorded timestamp, the clinician names and the doctor
+// commission that the Audit Log → Payments tab shows for the same receipt.
+export type MonthlyReportPayment = PaymentRecord & {
+  _doctorName?: string;
+  _treatmentDiscountAmount?: number;
+};
 
 export interface MonthlyReportRow {
   treatmentId: string;
@@ -90,6 +100,13 @@ export interface MonthlyReportSummary {
   production: number;
   payment: number;
   balance: number;
+  // Receipts collected in the report period that were applied to treatments
+  // dated before the report period (previous debt / remaining balance).
+  balanceCollections: number;
+  // Total of every active receipt in the report period (matches the Payments
+  // sheet total and the Audit Log → Payments tab). Includes treatment payments,
+  // previous-debt collections, service fees and any non-treatment charges.
+  collectedReceipts: number;
   serviceCharges: number;
   medicineSales: number;
   totalRevenue: number;
@@ -124,6 +141,7 @@ export interface MonthlyReportGroup {
 
 export interface MonthlyReport {
   costItems?: MonthlyReportCostItem[];
+  payments?: MonthlyReportPayment[];
   rows: MonthlyReportRow[];
   summary: MonthlyReportSummary;
   byTreatment: MonthlyReportGroup[];
@@ -243,7 +261,11 @@ export const groupMonthlyReportDetailRows = (rows: MonthlyReportRow[]): MonthlyR
   ));
 };
 
-const buildPaymentByTreatment = (records: MonthlyReportSourceRecord[], payments: PaymentRecord[]): Map<string, number> => {
+const buildPaymentByTreatment = (
+  records: MonthlyReportSourceRecord[],
+  payments: PaymentRecord[],
+  countedPaymentIds?: Set<string>
+): Map<string, number> => {
   const uniquePayments = dedupePaymentRecords(payments).filter((payment) => !payment.voidedAt);
   const allocations = allocateCommissionablePayments(
     records.map(record => ({
@@ -263,6 +285,10 @@ const buildPaymentByTreatment = (records: MonthlyReportSourceRecord[], payments:
   );
 
   return allocations.reduce((map, allocation) => {
+    // Payments outside the report period are still part of the FIFO allocation
+    // (they consume older balances), but only in-period receipts may count as
+    // this period's collections.
+    if (countedPaymentIds && !countedPaymentIds.has(allocation.paymentId)) return map;
     map.set(allocation.treatmentId, money((map.get(allocation.treatmentId) || 0) + allocation.amount));
     return map;
   }, new Map<string, number>());
@@ -344,7 +370,7 @@ const allocatePaymentCostsByTreatment = (
   return result;
 };
 
-const summarizeRows = (rows: MonthlyReportRow[], operatingExpenses = 0, unassignedServiceCharges = 0, unassignedMedicineSales = 0): MonthlyReportSummary => {
+const summarizeRows = (rows: MonthlyReportRow[], operatingExpenses = 0, unassignedServiceCharges = 0, unassignedMedicineSales = 0): Omit<MonthlyReportSummary, 'balanceCollections' | 'collectedReceipts'> => {
   const total = (selector: (row: MonthlyReportRow) => number) => money(rows.reduce((sum, row) => sum + selector(row), 0));
   const production = total(row => row.cost);
   const payment = total(row => row.payment);
@@ -452,6 +478,47 @@ const appendUnassignedRevenueGroups = (
   return result;
 };
 
+const isInsideReportPeriod = (date: string, dateFrom?: string, dateTo?: string): boolean => (
+  (!dateFrom || !date || date >= dateFrom) && (!dateTo || !date || date <= dateTo)
+);
+
+// The report Payments table is taken from the Audit Log → Payments tab, not from
+// a second calculation of its own. `buildAuditLogRows` is the builder the Records
+// page renders, so the receipts listed here, the recorded date/time they show and
+// the doctor commission attached to each one are the same values as that tab.
+//
+// The data layer also loads the stored commission ledger total of every receipt.
+// That stored total is exactly what the tab shows, so it wins over the row
+// builder's inference, which can only see the report's own patient history.
+const buildReportPayments = (
+  records: MonthlyReportSourceRecord[],
+  appointments: Appointment[],
+  payments: PaymentRecord[],
+  dateFrom?: string,
+  dateTo?: string
+): MonthlyReportPayment[] => {
+  const storedDoctorEarnings = new Map<string, number>();
+  payments.forEach((payment) => {
+    if (typeof payment.doctorEarned === 'number') storedDoctorEarnings.set(payment.id, payment.doctorEarned);
+  });
+
+  return buildAuditLogRows(records, appointments, true, payments)
+    .filter((row): row is Extract<AuditExportRow, { kind: 'payment' }> => row.kind === 'payment')
+    // The Audit Log filters payments on the same date value it displays, so the
+    // report lists exactly the receipts the tab shows for this period.
+    .filter((row) => isInsideReportPeriod(getAuditLogEventDate(row), dateFrom, dateTo))
+    .sort((a, b) => a.sortDate.localeCompare(b.sortDate)
+      || (a.payment.receiptNumber || '').localeCompare(b.payment.receiptNumber || '')
+      || a.payment.id.localeCompare(b.payment.id))
+    .map((row) => ({
+      ...row.payment,
+      // A voided receipt earned no commission, so it is listed without earnings.
+      doctorEarned: row.payment.voidedAt
+        ? 0
+        : storedDoctorEarnings.get(row.payment.id) ?? row.payment.doctorEarned ?? 0
+    }));
+};
+
 export const buildMonthlyReport = (data: MonthlyReportData): MonthlyReport => {
   // An explicitly empty ledger is authoritative too. Never allocate these costs
   // through treatments: their expense period can differ from production.
@@ -486,9 +553,23 @@ export const buildMonthlyReport = (data: MonthlyReportData): MonthlyReport => {
     report.summary.netMargin = report.summary.totalRevenue > 0 ? report.summary.netProfit / report.summary.totalRevenue : 0;
     return report;
   }
-  const paymentByTreatment = buildPaymentByTreatment(data.allocationRecords || data.records, data.payments);
+  const allocationRecords = data.allocationRecords || data.records;
+  // The Payments table of the report mirrors the Audit Log → Payments tab:
+  // the same receipts, the same recorded date/time and the same doctor
+  // commission per receipt. Only receipts shown on that tab for this period are
+  // listed, while every receipt (including the older ones) still takes part in
+  // the FIFO allocation so remaining balances stay correct.
+  const reportPayments = buildReportPayments(
+    allocationRecords,
+    data.appointments || [],
+    data.payments,
+    data.dateFrom,
+    data.dateTo
+  );
+  const reportPaymentIds = new Set(reportPayments.map((payment) => payment.id));
+  const paymentByTreatment = buildPaymentByTreatment(allocationRecords, data.payments, reportPaymentIds);
   const paymentCostsByTreatment = allocatePaymentCostsByTreatment(
-    data.allocationRecords || data.records,
+    allocationRecords,
     data.payments,
     data.paymentCostSummaries || {}
   );
@@ -640,9 +721,27 @@ export const buildMonthlyReport = (data: MonthlyReportData): MonthlyReport => {
     };
   }).sort((a, b) => a.date.localeCompare(b.date) || a.patientName.localeCompare(b.patientName) || a.treatmentId.localeCompare(b.treatmentId));
 
+  // Collections applied to treatments dated before the report period (previous
+  // debt). `paymentByTreatment` is keyed by treatment id; any id that is not in
+  // the in-period `rows` set was allocated to older debt.
+  const balanceCollections = money(
+    Array.from(paymentByTreatment.entries())
+      .filter(([treatmentId]) => !recordById.has(treatmentId))
+      .reduce((sum, [, amount]) => sum + amount, 0)
+  );
+  const collectedReceipts = money(
+    reportPayments
+      .filter((payment) => !payment.voidedAt)
+      .reduce((sum, payment) => sum + positiveMoney(payment.amount), 0)
+  );
+
   return {
     rows,
-    summary: summarizeRows(rows, operatingExpenses, unassignedServiceCharges, unassignedMedicineSales),
+    summary: {
+      ...summarizeRows(rows, operatingExpenses, unassignedServiceCharges, unassignedMedicineSales),
+      balanceCollections,
+      collectedReceipts
+    },
     byTreatment: appendUnassignedRevenueGroups(
       groupRows(rows, row => row.treatment),
       unassignedServiceCharges,
@@ -664,7 +763,10 @@ export const buildMonthlyReport = (data: MonthlyReportData): MonthlyReport => {
       unassignedMedicineSales,
       unassignedMedicinePatientIds.size
     ),
-    expenses: data.expenses || []
+    expenses: data.expenses || [],
+    // Already Audit Log payment rows, so every listed receipt carries the
+    // commission amount the Payment Log shows for it.
+    payments: reportPayments
   };
 };
 

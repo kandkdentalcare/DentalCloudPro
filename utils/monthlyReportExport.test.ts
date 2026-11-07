@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import autoTable from 'jspdf-autotable';
 import * as XLSX from 'xlsx-js-style';
+import { formatCurrency } from './currency';
+import { formatAuditCreatedAt } from './auditLogExport';
 import { buildMonthlyReport, type MonthlyReport, type MonthlyReportMetadata } from './monthlyReport';
 import { buildMonthlyReportExcelWorkbook, exportMonthlyReportToPDF } from './monthlyReportExport';
 
@@ -30,6 +32,7 @@ const report: MonthlyReport = {
   }],
   summary: {
     treatmentCount: 1, patientCount: 1, standardProduction: 100000, discount: 0, production: 100000, payment: 60000, balance: 40000,
+    balanceCollections: 6000, collectedReceipts: 66000,
     serviceCharges: 0, medicineSales: 0, totalRevenue: 100000, materialCost: 10000, labCost: 5000, specialDoctorCost: 0,
     mlsTotal: 15000, doctorCost: 20000, operatingExpenses: 0, totalCost: 35000, netProfit: 65000,
     netMargin: 0.65, collectionRate: 0.6
@@ -156,7 +159,7 @@ describe('monthly report Excel workbook', () => {
 
     const summary = workbook.Sheets['Executive Summary'];
     expect(summary.A1.v).toBe('MONTHLY TREATMENT & PROFITABILITY REPORT');
-    expect(summary.A5.v).toBe('REPORT VOLUME');
+    expect(summary.A5.v).toBe('REPORT VOLUME & COLLECTIONS');
     expect(summary.D5.v).toBe('REVENUE & COLLECTIONS');
     expect(summary.G5.v).toBe('COSTS & PROFITABILITY');
     expect(summary.E6.z).toBe('#,##0" Ks"');
@@ -276,6 +279,13 @@ describe('monthly report Excel workbook', () => {
     expect(workbook.Sheets['Executive Summary'].D10.v).toBe('Medicine Sales');
     expect(workbook.Sheets['Executive Summary'].G9.v).toBe('MLS Total');
     expect(workbook.Sheets['Executive Summary'].G11.v).toBe('Operating Expenses');
+    // Reconciliation lines: previous-debt collections and the all-receipts total.
+    expect(workbook.Sheets['Executive Summary'].A5.v).toBe('REPORT VOLUME & COLLECTIONS');
+    expect(workbook.Sheets['Executive Summary'].A8.v).toBe('Balance Collections (Prev. Debt)');
+    expect(workbook.Sheets['Executive Summary'].B8.v).toBe(6000);
+    expect(workbook.Sheets['Executive Summary'].B8.z).toBe('#,##0" Ks"');
+    expect(workbook.Sheets['Executive Summary'].A9.v).toBe('Total Collected Receipts');
+    expect(workbook.Sheets['Executive Summary'].B9.v).toBe(66000);
     expect(workbook.Sheets['Treatment Detail'].O4.v).toBe('Service Charges');
     expect(workbook.Sheets['Treatment Detail'].P4.v).toBe('Medicine Sales');
     expect(workbook.Sheets['Treatment Detail'].U4.v).toBe('MLS Total');
@@ -288,6 +298,7 @@ describe('monthly report Excel workbook', () => {
       rows: [],
       summary: {
         treatmentCount: 0, patientCount: 0, standardProduction: 0, discount: 0, production: 0, payment: 0, balance: 0,
+        balanceCollections: 0, collectedReceipts: 0,
         serviceCharges: 0, medicineSales: 0, totalRevenue: 0, materialCost: 0, labCost: 0, specialDoctorCost: 0,
         mlsTotal: 0, doctorCost: 0, operatingExpenses: 0, totalCost: 0, netProfit: 0, netMargin: 0, collectionRate: 0
       },
@@ -337,6 +348,7 @@ describe('monthly report Excel workbook', () => {
       ],
       summary: {
         treatmentCount: 4, patientCount: 1, standardProduction: 200000, discount: 0, production: 200000, payment: 100000, balance: 100000,
+        balanceCollections: 0, collectedReceipts: 100000,
         serviceCharges: 0, medicineSales: 0, totalRevenue: 200000, materialCost: 15000, labCost: 10000, specialDoctorCost: 0,
         mlsTotal: 25000, doctorCost: 40000, operatingExpenses: 0, totalCost: 65000, netProfit: 135000,
         netMargin: 0.675, collectionRate: 0.5
@@ -363,4 +375,77 @@ describe('monthly report Excel workbook', () => {
     expect(byTreatment.B5.v).toBe(2);
     expect(byTreatment.A8.v).toBe('REPORT TOTAL');
   });
+  it('adds a Payments sheet that lists every payment record with active-only totals', async () => {
+    const reportWithPayments: MonthlyReport = {
+      ...report,
+      payments: [
+        { id: 'payment-1', patientId: 'patient-1', patient_name: 'Aye Aye', patient_type: 'Walk-in',
+          amount: 60000, date: '2026-07-10', type: 'PARTIAL', remainingBalance: 40000, balanceBefore: 100000,
+          paymentMethod: 'CASH', treatmentIds: ['treatment-1'], receiptNumber: 'R-1001', createdByUserName: 'Staff A',
+          doctorEarned: 6000 },
+        { id: 'payment-2', patientId: 'patient-2', patient_name: 'Bo Bo', patient_type: 'Member',
+          amount: 30000, date: '2026-07-12', type: 'FULL', remainingBalance: 0,
+          paymentMethod: 'KPAY', treatmentIds: ['treatment-2'], receiptNumber: 'R-1002', createdByUserName: 'Staff B',
+          createdAt: '2026-07-12T03:15:00Z',
+          doctorEarned: 3000 },
+        { id: 'payment-3', patientId: 'patient-3', patient_name: 'Voided Patient', amount: 5000, date: '2026-07-13',
+          type: 'PARTIAL', remainingBalance: 5000, voidedAt: '2026-07-14T00:00:00Z' },
+        // A collection against an older remaining balance: it has no treatment
+        // row inside this report period, so it is not allocated to any in-range
+        // treatment, but it must still be listed here.
+        { id: 'payment-4', patientId: 'patient-4', patient_name: 'Daw Mya', patient_type: 'Walk-in',
+          amount: 25000, date: '2026-07-15', type: 'PARTIAL', remainingBalance: 0, balanceBefore: 25000,
+          paymentMethod: 'CASH', treatmentIds: [], receiptNumber: 'R-1004', createdByUserName: 'Staff C' }
+      ]
+    };
+    const workbook = await buildMonthlyReportExcelWorkbook(reportWithPayments, metadata);
+    expect(workbook.SheetNames).toContain('Payments');
+    const sheet = workbook.Sheets['Payments'];
+
+    expect(sheet.A4.v).toBe('Date / Time');
+    expect(sheet.G4.v).toBe('Amount');
+    expect(sheet.K4.v).toBe('Doctor Earned');
+    expect(sheet.L4.v).toBe('Status');
+    expect(sheet.A5.v).toBe('2026-07-10');
+    // The date column shows the recorded date/time exactly as the Audit Log
+    // payments tab renders it for the same receipt.
+    expect(sheet.A6.v).toBe(formatAuditCreatedAt('2026-07-12T03:15:00Z'));
+    expect(sheet.C5.v).toBe('Aye Aye');
+    expect(sheet.F5.v).toBe('CASH');
+    expect(sheet.G5.v).toBe(60000);
+    // Doctor commission follows the receipt so the sheet matches the payment log.
+    expect(sheet.K5.v).toBe(6000);
+    expect(sheet.K6.v).toBe(3000);
+    expect(sheet.L5.v).toBe('Active');
+    expect(sheet.L6.v).toBe('Active');
+    expect(sheet.L7.v).toBe('Voided');
+    // Balance-only collection is listed with its balance snapshot even though
+    // it is not tied to any treatment in this report.
+    expect(sheet.A8.v).toBe('2026-07-15');
+    expect(sheet.C8.v).toBe('Daw Mya');
+    expect(sheet.G8.v).toBe(25000);
+    expect(sheet.H8.v).toBe(25000);
+    expect(sheet.I8.v).toBe(0);
+    expect(sheet.J8.v).toBe(0);
+    expect(sheet.L8.v).toBe('Active');
+    expect(sheet.A9.v).toBe('TOTAL (active payments)');
+    expect(sheet.G9.v).toBe(115000);
+
+    // The PDF professional report also lists every payment and shows the same
+    // reconciliation totals as the Excel summary.
+    vi.mocked(autoTable).mockClear();
+    exportMonthlyReportToPDF(reportWithPayments, metadata);
+    const paymentTable = vi.mocked(autoTable).mock.calls.find(call => call[1].head?.[0]?.[0] === 'Date / Time');
+    expect(paymentTable).toBeTruthy();
+    expect(paymentTable?.[1].head?.[0]).toContain('Receipt No.');
+    expect(paymentTable?.[1].head?.[0]).toContain('Remaining Balance');
+    expect(paymentTable?.[1].body).toHaveLength(4);
+    expect(paymentTable?.[1].foot?.[0]?.[0]).toBe('TOTAL (active payments)');
+    expect(paymentTable?.[1].foot?.[0]?.[6]).toBe(formatCurrency(115000, 'MMK'));
+    // The PDF table carries the same per-receipt doctor commission as the log.
+    expect(paymentTable?.[1].body?.[0]?.[10]).toBe(formatCurrency(6000, 'MMK'));
+    expect(paymentTable?.[1].body?.[1]?.[10]).toBe(formatCurrency(3000, 'MMK'));
+  });
+
+
 });

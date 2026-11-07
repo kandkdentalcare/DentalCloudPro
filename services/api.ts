@@ -662,6 +662,56 @@ const getDoctorEarningEntriesByTreatmentIds = async (treatmentIds: string[]) => 
   return entriesByTreatment;
 };
 
+// The "Doctor Earned" column of the Audit Log → Payments tab is the stored
+// commission ledger total of a receipt. The monthly report Payments sheet shows
+// the same receipts, so it loads that stored total per receipt instead of
+// recalculating it from the report's own (partial) treatment history.
+const getDoctorEarningTotalsByPaymentIds = async (paymentIds: string[]): Promise<Map<string, number>> => {
+  const totalsByPayment = new Map<string, number>();
+  const uniqueIds = Array.from(new Set(paymentIds.filter(Boolean)));
+  if (uniqueIds.length === 0) return totalsByPayment;
+
+  const logFailure = (failure: unknown) => {
+    const errorSummary = String((failure as any)?.message || failure).replace(/\s+/g, ' ').slice(0, 240);
+    console.warn('Unable to load doctor commission ledger entries for the monthly report payments.', errorSummary);
+  };
+
+  const pages = await mapWithConcurrency(
+    chunkUniqueIds(uniqueIds),
+    REPORT_REQUEST_CONCURRENCY,
+    async (idBatch) => {
+      try {
+        const { data, error } = await supabase
+          .from('doctor_commission_entries')
+          .select('payment_id, earnings')
+          .in('payment_id', idBatch);
+
+        if (error) {
+          // Commission only enriches the payment list; the report falls back to
+          // the Audit Log row calculation for receipts without a stored total.
+          logFailure(error);
+          return [] as any[];
+        }
+
+        return (data || []) as any[];
+      } catch (err) {
+        logFailure(err);
+        return [] as any[];
+      }
+    }
+  );
+
+  pages.flat().forEach((row: any) => {
+    if (!row?.payment_id) return;
+    totalsByPayment.set(
+      row.payment_id,
+      (totalsByPayment.get(row.payment_id) || 0) + Number(row.earnings || 0)
+    );
+  });
+
+  return totalsByPayment;
+};
+
 const isMissingFunctionError = (error: any, functionName: string): boolean => {
   const code = String(error?.code || '').toUpperCase();
   const message = String(error?.message || '').toLowerCase();
@@ -3859,7 +3909,7 @@ export const api = {
             let query = supabase
               .from('treatments')
               .select(withRelations
-                ? `id, location_id, patient_id, doctor_id, treatment_type_id, teeth, description, cost, standard_cost, discount_amount, pricing_note, doctor_earnings, date, patients(name, age, phone, city, ${regionColumn}, patient_type, balance), doctors(name)`
+                ? `id, location_id, patient_id, doctor_id, treatment_type_id, teeth, description, cost, standard_cost, discount_amount, pricing_note, doctor_earnings, date, patients(name, age, phone, city, ${regionColumn}, patient_type, balance), doctors(name, specialization, commission_type, commission_percentage, commission_per_visit)`
                 : 'id, location_id, patient_id, doctor_id, treatment_type_id, teeth, description, cost, standard_cost, discount_amount, pricing_note, doctor_earnings, date')
               .lte('date', dateTo)
               .order('date', { ascending: true })
@@ -3901,7 +3951,20 @@ export const api = {
             patient_balance: record.patients?.balance === undefined || record.patients?.balance === null
               ? null
               : Number(record.patients.balance || 0),
-            doctor_name: record.doctors?.name || undefined
+            doctor_name: record.doctors?.name || undefined,
+            // Commission configuration lets the Audit Log row builder infer the
+            // doctor commission of legacy receipts that have no ledger rows.
+            doctor_specialization: record.doctors?.specialization || null,
+            doctor_commission_type: resolveDoctorCommissionType({
+              commissionType: record.commission_type_snapshot ?? record.doctors?.commission_type,
+              specialization: record.doctors?.specialization
+            }),
+            doctor_commission_percentage: record.commission_percentage_snapshot !== undefined && record.commission_percentage_snapshot !== null
+              ? Number(record.commission_percentage_snapshot)
+              : record.doctors?.commission_percentage !== undefined ? Number(record.doctors.commission_percentage || 0) : null,
+            doctor_commission_per_visit: record.commission_per_visit_snapshot !== undefined && record.commission_per_visit_snapshot !== null
+              ? Number(record.commission_per_visit_snapshot)
+              : record.doctors?.commission_per_visit !== undefined ? Number(record.doctors.commission_per_visit || 0) : null
           })));
           if (page.length < pageSize) break;
         }
@@ -4771,7 +4834,7 @@ export const api = {
       const patientBatches = chunkMonthlyReportPatientIds(patientIds);
       const pageSize = 1000;
       const payments: PaymentRecord[] = [];
-      const loadPaymentPages = async (patientBatch?: string[], rangeStart?: string) => {
+      const loadPaymentPages = async (patientBatch?: string[], rangeStart?: string, voidedInPeriod = false) => {
         for (let offset = 0; ; offset += pageSize) {
         const buildQuery = (withRelations: boolean) => {
           let query = supabase
@@ -4786,6 +4849,11 @@ export const api = {
           if (locationId) query = query.eq('location_id', locationId);
           if (rangeStart) query = query.gte('payment_date', rangeStart);
           if (patientBatch?.length) query = query.in('patient_id', patientBatch);
+          if (voidedInPeriod) {
+            query = query
+              .gte('voided_at', `${dateFrom}T00:00:00`)
+              .lte('voided_at', `${dateTo}T23:59:59.999`);
+          }
           return query;
         };
 
@@ -4814,7 +4882,18 @@ export const api = {
       // has no treatment row in the same period (for example a manual service
       // fee or a payment against older debt).
       await loadPaymentPages(undefined, dateFrom);
-      return dedupePaymentRecords(payments);
+      // The Audit Log lists a voided receipt on its void date, so a receipt that
+      // was reversed inside the period is loaded here as well.
+      await loadPaymentPages(undefined, undefined, true);
+      const uniquePayments = dedupePaymentRecords(payments);
+      // Attach the stored ledger commission of each receipt so the report's
+      // Payments sheet shows the same "Doctor Earned" value as the Audit Log.
+      const doctorEarnedByPaymentId = await getDoctorEarningTotalsByPaymentIds(uniquePayments.map(payment => payment.id));
+      if (doctorEarnedByPaymentId.size === 0) return uniquePayments;
+      return uniquePayments.map((payment) => {
+        const doctorEarned = doctorEarnedByPaymentId.get(payment.id);
+        return doctorEarned === undefined ? payment : { ...payment, doctorEarned };
+      });
     },
     getPayments: async (locationId?: string, options?: {
       dateFrom?: string;

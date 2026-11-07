@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const supabaseMock = vi.hoisted(() => {
-  const state: any = { rowsByTable: {}, rangesByTable: {}, filtersByTable: {} };
+  const state: any = { rowsByTable: {}, rangesByTable: {}, filtersByTable: {}, inFiltersByTable: {} };
 
   state.from = vi.fn((table: string) => ({
     select: vi.fn(() => {
       let from = 0;
       let to = 999;
+      const inFilters: [string, unknown[]][] = [];
       const query: any = {
         order: vi.fn(() => query),
         eq: vi.fn((column: string, value: unknown) => {
@@ -25,7 +26,11 @@ const supabaseMock = vi.hoisted(() => {
           (state.filtersByTable[table] ||= []).push(['lt', column, value]);
           return query;
         }),
-        in: vi.fn(() => query),
+        in: vi.fn((column: string, values: unknown[]) => {
+          (state.filtersByTable[table] ||= []).push(['in', column, values]);
+          inFilters.push([column, values]);
+          return query;
+        }),
         or: vi.fn(() => query),
         range: vi.fn((nextFrom: number, nextTo: number) => {
           from = nextFrom;
@@ -33,10 +38,16 @@ const supabaseMock = vi.hoisted(() => {
           (state.rangesByTable[table] ||= []).push([from, to]);
           return query;
         }),
-        then: (resolve: any, reject: any) => Promise.resolve({
-          data: (state.rowsByTable[table] || []).slice(from, to + 1),
-          error: null
-        }).then(resolve, reject)
+        then: (resolve: any, reject: any) => {
+          // Mirror PostgREST: an `.in()` filter only returns the matching rows.
+          const matchingRows = (state.rowsByTable[table] || []).filter((row: any) => (
+            inFilters.every(([column, values]) => values.includes(row[column]))
+          ));
+          return Promise.resolve({
+            data: matchingRows.slice(from, to + 1),
+            error: null
+          }).then(resolve, reject);
+        }
       };
       return query;
     })
@@ -152,5 +163,35 @@ describe('high-volume Supabase fetches', () => {
       ['eq', 'location_id', 'location-1'],
       ['eq', 'patient_id', 'patient-1']
     ]));
+  });
+
+  it('loads receipts voided inside the monthly report period for the audit payments tab', async () => {
+    supabaseMock.rowsByTable.payments = rows('payments');
+    supabaseMock.rowsByTable.doctor_commission_entries = [
+      { id: 'entry-1', payment_id: 'payments-0000', earnings: 750 },
+      { id: 'entry-2', payment_id: 'payments-0000', earnings: 250 }
+    ];
+
+    const payments = await api.finance.getMonthlyReportPayments({
+      locationId: 'location-1',
+      dateFrom: '2026-08-01',
+      dateTo: '2026-08-31',
+      patientIds: ['patient-1']
+    });
+
+    expect(payments).toHaveLength(1001);
+    // A receipt voided inside the period is listed by the Audit Log on its void
+    // date, so the report query must load it even when it is dated earlier.
+    expect(supabaseMock.filtersByTable.payments).toEqual(expect.arrayContaining([
+      ['eq', 'location_id', 'location-1'],
+      ['lte', 'payment_date', '2026-08-31'],
+      ['gte', 'payment_date', '2026-08-01'],
+      ['gte', 'voided_at', '2026-08-01T00:00:00'],
+      ['lte', 'voided_at', '2026-08-31T23:59:59.999']
+    ]));
+    // The stored commission ledger total of a receipt is attached so the report
+    // shows the same "Doctor Earned" value as the Audit Log → Payments tab.
+    expect(payments.find(payment => payment.id === 'payments-0000')?.doctorEarned).toBe(1000);
+    expect(payments.find(payment => payment.id === 'payments-0001')?.doctorEarned).toBeUndefined();
   });
 });
